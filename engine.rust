@@ -1,0 +1,662 @@
+#![allow(dead_code)]
+#![feature(asm_const)]
+#![feature(stdsimd)]
+#![feature(portable_simd)]
+#![feature(allocator_api)]
+
+use std::arch::{asm, global_asm};
+use std::alloc::{GlobalAlloc, Layout};
+use std::mem::{align_of, size_of};
+use std::ptr::{self, NonNull};
+use std::simd::{f32x16, f32x8, mask32x16, mask32x8, Simd, SimdFloat};
+use std::sync::Arc;
+use rayon::prelude::*;
+use libc::{cpu_set_t, sched_setaffinity, CPU_SET, mmap, munmap, MAP_ANONYMOUS, MAP_PRIVATE, MAP_HUGETLB, PROT_READ, PROT_WRITE, posix_memalign};
+use hwloc::{Topology, CPUBindFlags, MemoryBindingFlags};
+
+const L1_CACHE: usize = 48 * 1024;
+const L2_CACHE: usize = 1280 * 1024;
+const L3_CACHE: usize = 60 * 1024 * 1024;
+const PAGE_SIZE_2MB: usize = 2 * 1024 * 1024;
+const PAGE_SIZE_1GB: usize = 1024 * 1024 * 1024;
+const CACHE_LINE: usize = 64;
+
+struct HugePageAllocator;
+
+unsafe impl GlobalAlloc for HugePageAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let alignment = layout.align().max(64);
+        let size = layout.size();
+        
+        if size >= PAGE_SIZE_2MB {
+            let huge_page_size = if size >= PAGE_SIZE_1GB {
+                PAGE_SIZE_1GB
+            } else {
+                PAGE_SIZE_2MB
+            };
+            
+            let pages = (size + huge_page_size - 1) / huge_page_size;
+            let total_size = pages * huge_page_size;
+            
+            let ptr = mmap(
+                ptr::null_mut(),
+                total_size,
+                PROT_READ | PROT_WRITE,
+                MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB,
+                -1,
+                0
+            );
+            
+            if ptr != libc::MAP_FAILED {
+                return ptr as *mut u8;
+            }
+        }
+        
+        let mut aligned_ptr: *mut libc::c_void = std::ptr::null_mut();
+        let result = posix_memalign(&mut aligned_ptr, alignment, size);
+        
+        if result == 0 {
+            aligned_ptr as *mut u8
+        } else {
+            std::ptr::null_mut()
+        }
+    }
+    
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        let size = layout.size();
+        
+        if size >= PAGE_SIZE_2MB {
+            munmap(ptr as *mut _, size);
+        } else {
+            libc::free(ptr as *mut libc::c_void);
+        }
+    }
+}
+
+#[global_allocator]
+static GLOBAL_ALLOC: HugePageAllocator = HugePageAllocator;
+
+#[repr(align(64))]
+struct AlignedBuffer {
+    data: *mut f32,
+    size: usize,
+    capacity: usize,
+}
+
+impl AlignedBuffer {
+    fn new(size: usize) -> Self {
+        let alignment = 64;
+        let mut ptr: *mut libc::c_void = std::ptr::null_mut();
+        
+        unsafe {
+            let result = posix_memalign(&mut ptr, alignment, size * size_of::<f32>());
+            if result != 0 {
+                panic!("Failed to allocate aligned memory");
+            }
+            
+            ptr::write_bytes(ptr as *mut u8, 0, size * size_of::<f32>());
+        }
+        
+        AlignedBuffer {
+            data: ptr as *mut f32,
+            size,
+            capacity: size,
+        }
+    }
+    
+    fn as_mut_ptr(&mut self) -> *mut f32 {
+        self.data
+    }
+    
+    fn as_ptr(&self) -> *const f32 {
+        self.data
+    }
+}
+
+impl Drop for AlignedBuffer {
+    fn drop(&mut self) {
+        unsafe {
+            libc::free(self.data as *mut libc::c_void);
+        }
+    }
+}
+
+struct Architecture {
+    has_avx512: bool,
+    has_amx_intel: bool,
+    has_neon: bool,
+    has_sve: bool,
+    has_apple_amx: bool,
+    cache_line_size: usize,
+    num_cores: usize,
+    numa_nodes: usize,
+}
+
+impl Architecture {
+    fn detect() -> Self {
+        #[cfg(target_arch = "x86_64")]
+        let has_avx512 = is_x86_feature_detected!("avx512f");
+        #[cfg(not(target_arch = "x86_64"))]
+        let has_avx512 = false;
+        
+        #[cfg(target_arch = "x86_64")]
+        let has_amx_intel = is_x86_feature_detected!("amx_tile");
+        #[cfg(not(target_arch = "x86_64"))]
+        let has_amx_intel = false;
+        
+        #[cfg(target_arch = "aarch64")]
+        let has_neon = true;
+        #[cfg(not(target_arch = "aarch64"))]
+        let has_neon = false;
+        
+        #[cfg(target_arch = "aarch64")]
+        let has_sve = false;
+        #[cfg(not(target_arch = "aarch64"))]
+        let has_sve = false;
+        
+        #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+        let has_apple_amx = true;
+        #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
+        let has_apple_amx = false;
+        
+        Architecture {
+            has_avx512,
+            has_amx_intel,
+            has_neon,
+            has_sve,
+            has_apple_amx,
+            cache_line_size: CACHE_LINE,
+            num_cores: num_cpus::get(),
+            numa_nodes: 1,
+        }
+    }
+}
+
+trait MicroKernel {
+    fn compute(&self, a: *const f32, b: *const f32, c: *mut f32, m: usize, n: usize, k: usize, lda: usize, ldb: usize, ldc: usize);
+    fn block_m(&self) -> usize;
+    fn block_n(&self) -> usize;
+    fn block_k(&self) -> usize;
+}
+
+#[cfg(target_arch = "x86_64")]
+struct AVX512Kernel6x16;
+
+#[cfg(target_arch = "x86_64")]
+impl MicroKernel for AVX512Kernel6x16 {
+    fn compute(&self, a: *const f32, b: *const f32, c: *mut f32, m: usize, n: usize, k: usize, lda: usize, ldb: usize, ldc: usize) {
+        unsafe {
+            let k_iters = k / 1;
+            
+            asm!(
+                "
+                push rbp
+                mov rbp, rsp
+                and rsp, -64
+                
+                mov rax, rdi
+                mov rbx, rsi
+                mov rcx, rdx
+                mov r8, rcx
+                mov r9, r8
+                mov r10, r9
+                mov r11, r10
+                
+                vxorps zmm0, zmm0, zmm0
+                vxorps zmm1, zmm1, zmm1
+                vxorps zmm2, zmm2, zmm2
+                vxorps zmm3, zmm3, zmm3
+                vxorps zmm4, zmm4, zmm4
+                vxorps zmm5, zmm5, zmm5
+                
+                .loop_k:
+                    vmovaps zmm6, [rbx]
+                    
+                    vbroadcastss zmm7,  DWORD PTR [rax]
+                    vbroadcastss zmm8,  DWORD PTR [rax + 4]
+                    vbroadcastss zmm9,  DWORD PTR [rax + 8]
+                    vbroadcastss zmm10, DWORD PTR [rax + 12]
+                    vbroadcastss zmm11, DWORD PTR [rax + 16]
+                    vbroadcastss zmm12, DWORD PTR [rax + 20]
+                    
+                    vfmadd231ps zmm0, zmm7,  zmm6
+                    vfmadd231ps zmm1, zmm8,  zmm6
+                    vfmadd231ps zmm2, zmm9,  zmm6
+                    vfmadd231ps zmm3, zmm10, zmm6
+                    vfmadd231ps zmm4, zmm11, zmm6
+                    vfmadd231ps zmm5, zmm12, zmm6
+                    
+                    add rax, 24
+                    add rbx, 64
+                    
+                    dec rcx
+                    jnz .loop_k
+                
+                vmovaps [r10],      zmm0
+                vmovaps [r10 + 64], zmm1
+                vmovaps [r10 + 128], zmm2
+                vmovaps [r10 + 192], zmm3
+                vmovaps [r10 + 256], zmm4
+                vmovaps [r10 + 320], zmm5
+                
+                leave
+                ret
+                ",
+                in("rdi") a,
+                in("rsi") b,
+                in("rdx") k_iters,
+                in("rcx") lda,
+                in("r8") ldb,
+                in("r9") c,
+                in("r10") ldc,
+            );
+        }
+    }
+    
+    fn block_m(&self) -> usize { 6 }
+    fn block_n(&self) -> usize { 16 }
+    fn block_k(&self) -> usize { 1 }
+}
+
+#[cfg(target_arch = "aarch64")]
+struct NEONKernel4x8;
+
+#[cfg(target_arch = "aarch64")]
+impl MicroKernel for NEONKernel4x8 {
+    fn compute(&self, a: *const f32, b: *const f32, c: *mut f32, m: usize, n: usize, k: usize, lda: usize, ldb: usize, ldc: usize) {
+        use std::arch::aarch64::*;
+        
+        unsafe {
+            for i in (0..m).step_by(4) {
+                let block_m = 4.min(m - i);
+                
+                for j in (0..n).step_by(8) {
+                    let block_n = 8.min(n - j);
+                    
+                    let mut accum00 = vdupq_n_f32(0.0);
+                    let mut accum01 = vdupq_n_f32(0.0);
+                    let mut accum10 = vdupq_n_f32(0.0);
+                    let mut accum11 = vdupq_n_f32(0.0);
+                    let mut accum20 = vdupq_n_f32(0.0);
+                    let mut accum21 = vdupq_n_f32(0.0);
+                    let mut accum30 = vdupq_n_f32(0.0);
+                    let mut accum31 = vdupq_n_f32(0.0);
+                    
+                    for kk in 0..k {
+                        let a_val0 = vdupq_n_f32(*a.add(i * lda + kk));
+                        let a_val1 = if block_m > 1 { vdupq_n_f32(*a.add((i + 1) * lda + kk)) } else { vdupq_n_f32(0.0) };
+                        let a_val2 = if block_m > 2 { vdupq_n_f32(*a.add((i + 2) * lda + kk)) } else { vdupq_n_f32(0.0) };
+                        let a_val3 = if block_m > 3 { vdupq_n_f32(*a.add((i + 3) * lda + kk)) } else { vdupq_n_f32(0.0) };
+                        
+                        let b_ptr = b.add(kk * ldb + j);
+                        let b_vec0 = vld1q_f32(b_ptr);
+                        let b_vec1 = if block_n > 4 { vld1q_f32(b_ptr.add(4)) } else { vdupq_n_f32(0.0) };
+                        
+                        accum00 = vfmaq_f32(accum00, a_val0, b_vec0);
+                        accum01 = vfmaq_f32(accum01, a_val0, b_vec1);
+                        
+                        accum10 = vfmaq_f32(accum10, a_val1, b_vec0);
+                        accum11 = vfmaq_f32(accum11, a_val1, b_vec1);
+                        
+                        accum20 = vfmaq_f32(accum20, a_val2, b_vec0);
+                        accum21 = vfmaq_f32(accum21, a_val2, b_vec1);
+                        
+                        accum30 = vfmaq_f32(accum30, a_val3, b_vec0);
+                        accum31 = vfmaq_f32(accum31, a_val3, b_vec1);
+                    }
+                    
+                    let c_base00 = c.add(i * ldc + j);
+                    vst1q_f32(c_base00, vaddq_f32(vld1q_f32(c_base00), accum00));
+                    
+                    if block_n > 4 {
+                        vst1q_f32(c_base00.add(4), vaddq_f32(vld1q_f32(c_base00.add(4)), accum01));
+                    }
+                    
+                    if block_m > 1 {
+                        let c_base10 = c.add((i + 1) * ldc + j);
+                        vst1q_f32(c_base10, vaddq_f32(vld1q_f32(c_base10), accum10));
+                        
+                        if block_n > 4 {
+                            vst1q_f32(c_base10.add(4), vaddq_f32(vld1q_f32(c_base10.add(4)), accum11));
+                        }
+                    }
+                    
+                    if block_m > 2 {
+                        let c_base20 = c.add((i + 2) * ldc + j);
+                        vst1q_f32(c_base20, vaddq_f32(vld1q_f32(c_base20), accum20));
+                        
+                        if block_n > 4 {
+                            vst1q_f32(c_base20.add(4), vaddq_f32(vld1q_f32(c_base20.add(4)), accum21));
+                        }
+                    }
+                    
+                    if block_m > 3 {
+                        let c_base30 = c.add((i + 3) * ldc + j);
+                        vst1q_f32(c_base30, vaddq_f32(vld1q_f32(c_base30), accum30));
+                        
+                        if block_n > 4 {
+                            vst1q_f32(c_base30.add(4), vaddq_f32(vld1q_f32(c_base30.add(4)), accum31));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    fn block_m(&self) -> usize { 4 }
+    fn block_n(&self) -> usize { 8 }
+    fn block_k(&self) -> usize { 1 }
+}
+
+#[cfg(target_arch = "aarch64")]
+struct AppleAMXKernel;
+
+#[cfg(target_arch = "aarch64")]
+impl MicroKernel for AppleAMXKernel {
+    fn compute(&self, a: *const f32, b: *const f32, c: *mut f32, m: usize, n: usize, k: usize, lda: usize, ldb: usize, ldc: usize) {
+        unsafe {
+            extern "C" {
+                fn vDSP_mmul(
+                    a: *const f32,
+                    a_stride: i32,
+                    b: *const f32,
+                    b_stride: i32,
+                    c: *mut f32,
+                    c_stride: i32,
+                    m: usize,
+                    n: usize,
+                    k: usize,
+                );
+            }
+            
+            vDSP_mmul(
+                a,
+                lda as i32,
+                b,
+                ldb as i32,
+                c,
+                ldc as i32,
+                m,
+                n,
+                k,
+            );
+        }
+    }
+    
+    fn block_m(&self) -> usize { 16 }
+    fn block_n(&self) -> usize { 16 }
+    fn block_k(&self) -> usize { 16 }
+}
+
+struct FallbackKernel;
+
+impl MicroKernel for FallbackKernel {
+    fn compute(&self, a: *const f32, b: *const f32, c: *mut f32, m: usize, n: usize, k: usize, lda: usize, ldb: usize, ldc: usize) {
+        unsafe {
+            for i in 0..m {
+                for j in 0..n {
+                    let mut sum = 0.0;
+                    for kk in 0..k {
+                        sum += *a.add(i * lda + kk) * *b.add(kk * ldb + j);
+                    }
+                    *c.add(i * ldc + j) += sum;
+                }
+            }
+        }
+    }
+    
+    fn block_m(&self) -> usize { 1 }
+    fn block_n(&self) -> usize { 1 }
+    fn block_k(&self) -> usize { 1 }
+}
+
+struct KernelSelector {
+    arch: Architecture,
+}
+
+impl KernelSelector {
+    fn new() -> Self {
+        KernelSelector {
+            arch: Architecture::detect(),
+        }
+    }
+    
+    fn select_kernel(&self, m: usize, n: usize, k: usize) -> Box<dyn MicroKernel> {
+        #[cfg(target_arch = "x86_64")]
+        {
+            if self.arch.has_avx512 && m >= 6 && n >= 16 && k >= 1 {
+                return Box::new(AVX512Kernel6x16);
+            }
+        }
+        
+        #[cfg(target_arch = "aarch64")]
+        {
+            if self.arch.has_apple_amx && m >= 16 && n >= 16 && k >= 16 {
+                return Box::new(AppleAMXKernel);
+            }
+            
+            if self.arch.has_neon && m >= 4 && n >= 8 && k >= 1 {
+                return Box::new(NEONKernel4x8);
+            }
+        }
+        
+        Box::new(FallbackKernel)
+    }
+}
+
+struct CacheOptimizer {
+    l1_tile_m: usize,
+    l1_tile_n: usize,
+    l1_tile_k: usize,
+    l2_tile_m: usize,
+    l2_tile_n: usize,
+    l2_tile_k: usize,
+    l3_tile_m: usize,
+    l3_tile_n: usize,
+    l3_tile_k: usize,
+}
+
+impl CacheOptimizer {
+    fn new(arch: &Architecture) -> Self {
+        let l1_size = L1_CACHE * 8 / 10;
+        let l2_size = L2_CACHE * 8 / 10;
+        let l3_size = L3_CACHE * 8 / 10;
+        
+        let element_size = size_of::<f32>();
+        
+        let l1_tile_m = 240;
+        let l1_tile_n = 480;
+        let l1_tile_k = 120;
+        
+        let l2_tile_m = 960;
+        let l2_tile_n = 1920;
+        let l2_tile_k = 480;
+        
+        let l3_tile_m = 3840;
+        let l3_tile_n = 7680;
+        let l3_tile_k = 1920;
+        
+        CacheOptimizer {
+            l1_tile_m,
+            l1_tile_n,
+            l1_tile_k,
+            l2_tile_m,
+            l2_tile_n,
+            l2_tile_k,
+            l3_tile_m,
+            l3_tile_n,
+            l3_tile_k,
+        }
+    }
+}
+
+struct GEMMExecutor {
+    kernel_selector: KernelSelector,
+    cache_optimizer: CacheOptimizer,
+    thread_pool: rayon::ThreadPool,
+}
+
+impl GEMMExecutor {
+    fn new() -> Self {
+        let arch = Architecture::detect();
+        let kernel_selector = KernelSelector::new();
+        let cache_optimizer = CacheOptimizer::new(&arch);
+        
+        let thread_pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(arch.num_cores)
+            .build()
+            .unwrap();
+        
+        GEMMExecutor {
+            kernel_selector,
+            cache_optimizer,
+            thread_pool,
+        }
+    }
+    
+    fn gemm(
+        &self,
+        a: &AlignedBuffer,
+        b: &AlignedBuffer,
+        c: &mut AlignedBuffer,
+        m: usize,
+        n: usize,
+        k: usize,
+        alpha: f32,
+        beta: f32,
+    ) {
+        let total_tiles_m = (m + self.cache_optimizer.l3_tile_m - 1) / self.cache_optimizer.l3_tile_m;
+        let total_tiles_n = (n + self.cache_optimizer.l3_tile_n - 1) / self.cache_optimizer.l3_tile_n;
+        
+        (0..total_tiles_m * total_tiles_n).into_par_iter().for_each(|tile_idx| {
+            let tile_i = (tile_idx / total_tiles_n) * self.cache_optimizer.l3_tile_m;
+            let tile_j = (tile_idx % total_tiles_n) * self.cache_optimizer.l3_tile_n;
+            
+            let tile_m = self.cache_optimizer.l3_tile_m.min(m - tile_i);
+            let tile_n = self.cache_optimizer.l3_tile_n.min(n - tile_j);
+            
+            let mut local_c = AlignedBuffer::new(tile_m * tile_n);
+            
+            for tk in (0..k).step_by(self.cache_optimizer.l3_tile_k) {
+                let tile_k = self.cache_optimizer.l3_tile_k.min(k - tk);
+                
+                unsafe {
+                    self.process_tile(
+                        a.as_ptr().add(tile_i * k + tk),
+                        b.as_ptr().add(tk * n + tile_j),
+                        local_c.as_mut_ptr(),
+                        tile_m,
+                        tile_n,
+                        tile_k,
+                        k,
+                        n,
+                        tile_n,
+                    );
+                }
+            }
+            
+            unsafe {
+                self.accumulate_result(
+                    c.as_mut_ptr().add(tile_i * n + tile_j),
+                    local_c.as_ptr(),
+                    n,
+                    tile_m,
+                    tile_n,
+                    alpha,
+                    beta,
+                );
+            }
+        });
+    }
+    
+    unsafe fn process_tile(
+        &self,
+        a: *const f32,
+        b: *const f32,
+        c: *mut f32,
+        m: usize,
+        n: usize,
+        k: usize,
+        lda: usize,
+        ldb: usize,
+        ldc: usize,
+    ) {
+        let kernel = self.kernel_selector.select_kernel(m, n, k);
+        
+        let block_m = kernel.block_m();
+        let block_n = kernel.block_n();
+        
+        for i in (0..m).step_by(self.cache_optimizer.l1_tile_m) {
+            let chunk_m = self.cache_optimizer.l1_tile_m.min(m - i);
+            
+            for j in (0..n).step_by(self.cache_optimizer.l1_tile_n) {
+                let chunk_n = self.cache_optimizer.l1_tile_n.min(n - j);
+                
+                for kk in (0..k).step_by(self.cache_optimizer.l1_tile_k) {
+                    let chunk_k = self.cache_optimizer.l1_tile_k.min(k - kk);
+                    
+                    kernel.compute(
+                        a.add(i * lda + kk),
+                        b.add(kk * ldb + j),
+                        c.add(i * ldc + j),
+                        chunk_m,
+                        chunk_n,
+                        chunk_k,
+                        lda,
+                        ldb,
+                        ldc,
+                    );
+                }
+            }
+        }
+    }
+    
+    unsafe fn accumulate_result(
+        &self,
+        dst: *mut f32,
+        src: *const f32,
+        dst_stride: usize,
+        rows: usize,
+        cols: usize,
+        alpha: f32,
+        beta: f32,
+    ) {
+        let src_stride = cols;
+        
+        if alpha == 1.0 && beta == 0.0 {
+            for i in 0..rows {
+                ptr::copy_nonoverlapping(
+                    src.add(i * src_stride),
+                    dst.add(i * dst_stride),
+                    cols,
+                );
+            }
+        } else {
+            for i in 0..rows {
+                for j in 0..cols {
+                    let src_val = *src.add(i * src_stride + j);
+                    let dst_val = *dst.add(i * dst_stride + j);
+                    *dst.add(i * dst_stride + j) = alpha * src_val + beta * dst_val;
+                }
+            }
+        }
+    }
+}
+
+fn main() {
+    let gemm = GEMMExecutor::new();
+    
+    let m = 8192;
+    let n = 8192;
+    let k = 8192;
+    
+    let a = AlignedBuffer::new(m * k);
+    let b = AlignedBuffer::new(k * n);
+    let mut c = AlignedBuffer::new(m * n);
+    
+    let start = std::time::Instant::now();
+    gemm.gemm(&a, &b, &mut c, m, n, k, 1.0, 0.0);
+    let duration = start.elapsed();
+    
+    println!("GEMM {}x{}x{} completed in {:?}", m, n, k, duration);
+}
